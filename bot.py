@@ -19,7 +19,7 @@ import re
 import time
 import urllib.error
 import urllib.request
-from collections import defaultdict
+from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
 
 from telegram import ChatPermissions, Update
@@ -221,6 +221,7 @@ join_times = {}                  # (chat_id, user_id) -> время входа
 msg_times = defaultdict(list)    # (chat_id, user_id) -> [время сообщений]
 mat_counts = defaultdict(int)    # (chat_id, user_id) -> сколько раз удалён мат
 deleted_stats = defaultdict(int) # chat_id -> сколько спама удалено
+recent_msgs = deque(maxlen=300)  # (chat_id, msg_id, user_id, норм. текст) — для зачистки клонов
 # ----------------------------------------------------------------------
 
 
@@ -349,6 +350,9 @@ async def moderate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     key = (msg.chat_id, user.id)
     now = time.time()
+    norm_seen = normalize_text(msg.text or msg.caption or "")
+    if norm_seen:
+        recent_msgs.append((msg.chat_id, msg.message_id, user.id, norm_seen))
     log.info(
         "Сообщение: чат=%s (%s) юзер=%s: %s",
         msg.chat_id, msg.chat.title, user.id, (msg.text or msg.caption or "<медиа>")[:60],
@@ -471,9 +475,28 @@ async def cmd_spam(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         learned_phrases.append(norm)
         await asyncio.to_thread(save_learned)
         learned = True
+
+    # зачистка клонов: такие же сообщения от других аккаунтов
+    clones = 0
+    if len(norm) >= 10:
+        seen_uids = {spammer.id if spammer else None, context.bot.id}
+        for chat_id, msg_id, uid, text_n in list(recent_msgs):
+            if chat_id != msg.chat_id or uid in seen_uids:
+                continue
+            if text_n == norm or (len(text_n) > 25 and (text_n in norm or norm in text_n)):
+                try:
+                    await msg.chat.ban_member(uid, revoke_messages=True)
+                    seen_uids.add(uid)
+                    clones += 1
+                    log.info("cmd_spam: забанен клон %s в чате %s", uid, chat_id)
+                except Exception as exc:
+                    log.warning("cmd_spam: не удалось забанить клона %s: %s", uid, exc)
+
     parts = ["удалил"]
     if banned:
         parts.append("забанил")
+    if clones:
+        parts.append(f"ещё {clones} клон(а/ов)")
     if learned:
         parts.append("запомнил")
     try:
