@@ -10,11 +10,15 @@
   - по команде /antispam показывает статистику (для админов).
 """
 import asyncio
+import base64
+import json
 import logging
 import logging.handlers
 import os
 import re
 import time
+import urllib.error
+import urllib.request
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 
@@ -117,6 +121,76 @@ _SPAM_RE = re.compile(
 def normalize_text(text: str) -> str:
     return text.lower().translate(_HOMOGLYPHS).replace("ё", "е")
 
+
+# ----------------------------- ОБУЧЕНИЕ -----------------------------
+# Админ отвечает на спам командой /spam — бот удаляет сообщение, банит автора
+# и навсегда запоминает текст. /ham — откат (ответом на сообщение).
+# Запомненные фразы хранятся в learned.json и дублируются в GitHub-репозиторий,
+# чтобы переживать перезапуски хостинга.
+GH_TOKEN = os.environ.get("GH_TOKEN", "")
+GH_REPO = os.environ.get("GH_REPO", "")
+LEARNED_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "learned.json")
+learned_phrases: list = []
+
+
+def load_learned() -> None:
+    global learned_phrases
+    try:
+        if os.path.exists(LEARNED_FILE):
+            with open(LEARNED_FILE, encoding="utf-8") as f:
+                learned_phrases = json.load(f)
+    except Exception as exc:
+        log.warning("Не смог прочитать learned.json: %s", exc)
+    if GH_TOKEN and GH_REPO:
+        try:
+            req = urllib.request.Request(
+                f"https://api.github.com/repos/{GH_REPO}/contents/learned.json",
+                headers={"Authorization": f"Bearer {GH_TOKEN}"},
+            )
+            with urllib.request.urlopen(req, timeout=15) as r:
+                data = json.load(r)
+            learned_phrases = json.loads(base64.b64decode(data["content"]).decode("utf-8"))
+            log.info("Загружено %d обученных фраз с GitHub", len(learned_phrases))
+        except urllib.error.HTTPError as e:
+            if e.code != 404:
+                log.warning("GitHub load: %s", e)
+        except Exception as exc:
+            log.warning("GitHub load: %s", exc)
+
+
+def save_learned() -> None:
+    try:
+        with open(LEARNED_FILE, "w", encoding="utf-8") as f:
+            json.dump(learned_phrases, f, ensure_ascii=False, indent=1)
+    except Exception as exc:
+        log.warning("Не смог сохранить learned.json: %s", exc)
+    if not (GH_TOKEN and GH_REPO):
+        return
+    try:
+        url = f"https://api.github.com/repos/{GH_REPO}/contents/learned.json"
+        headers = {"Authorization": f"Bearer {GH_TOKEN}"}
+        sha = None
+        try:
+            with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=15) as r:
+                sha = json.load(r).get("sha")
+        except urllib.error.HTTPError as e:
+            if e.code != 404:
+                raise
+        payload = {
+            "message": "learn: update spam phrases",
+            "content": base64.b64encode(
+                json.dumps(learned_phrases, ensure_ascii=False, indent=1).encode()
+            ).decode(),
+        }
+        if sha:
+            payload["sha"] = sha
+        req = urllib.request.Request(url, method="PUT", headers=headers,
+                                     data=json.dumps(payload).encode())
+        urllib.request.urlopen(req, timeout=15).read()
+        log.info("Обученные фразы сохранены на GitHub")
+    except Exception as exc:
+        log.warning("GitHub save: %s", exc)
+
 MUTE_PERMS = ChatPermissions(
     can_send_messages=False,
     can_send_audios=False,
@@ -188,6 +262,10 @@ def looks_like_spam(msg) -> bool:
 
     if _SPAM_RE.search(norm) or _SPAM_RE.search(low):
         return True
+    # обученные фразы (полные тексты спама, пойманного ранее)
+    for entry in learned_phrases:
+        if entry and (entry in norm or (len(norm) > 25 and norm in entry)):
+            return True
     if SPACED_LETTERS_RE.search(raw):
         return True
     if DELETE_BAD_LINKS and has_bad_link(msg):
@@ -341,6 +419,73 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     )
 
 
+async def cmd_spam(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    msg = update.message
+    user = update.effective_user
+    if user is None or not await is_admin(msg.chat_id, user.id, context):
+        return
+    target = msg.reply_to_message
+    if target is None:
+        await msg.reply_text("Отправь /spam ответом на спам-сообщение.")
+        return
+    spammer = target.from_user
+    text = (target.text or target.caption or "").strip()
+    try:
+        await target.delete()
+    except Exception as exc:
+        log.warning("cmd_spam delete: %s", exc)
+    banned = False
+    if spammer and spammer.id != context.bot.id:
+        try:
+            await msg.chat.ban_member(spammer.id, revoke_messages=True)
+            banned = True
+        except Exception as exc:
+            log.warning("cmd_spam ban: %s", exc)
+    norm = normalize_text(text)
+    learned = False
+    if len(norm) >= 10 and norm not in learned_phrases:
+        learned_phrases.append(norm)
+        await asyncio.to_thread(save_learned)
+        learned = True
+    parts = ["удалил"]
+    if banned:
+        parts.append("забанил")
+    if learned:
+        parts.append("запомнил")
+    reply = await msg.reply_text("✅ " + ", ".join(parts) + ".")
+    log.info("cmd_spam от %s: banned=%s learned=%s", user.id, banned, learned)
+    await asyncio.sleep(10)
+    for m in (reply, msg):
+        try:
+            await m.delete()
+        except Exception:
+            pass
+
+
+async def cmd_ham(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    msg = update.message
+    user = update.effective_user
+    if user is None or not await is_admin(msg.chat_id, user.id, context):
+        return
+    target = msg.reply_to_message
+    removed = False
+    if target is not None:
+        norm = normalize_text(target.text or target.caption or "")
+        if norm in learned_phrases:
+            learned_phrases.remove(norm)
+            await asyncio.to_thread(save_learned)
+            removed = True
+        if target.from_user:
+            try:
+                await msg.chat.unban_member(target.from_user.id, only_if_banned=True)
+            except Exception:
+                pass
+    await msg.reply_text(
+        "Ок, убрал из спам-листа и разбанил." if removed
+        else "Такого текста нет в спам-листе."
+    )
+
+
 def load_token() -> str:
     token = os.environ.get("BOT_TOKEN", "").strip()
     if not token:
@@ -388,12 +533,15 @@ def main() -> None:
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, on_new_members))
     app.add_handler(MessageHandler(filters.StatusUpdate.LEFT_CHAT_MEMBER, on_left_member))
     app.add_handler(CommandHandler("antispam", cmd_status, filters=filters.ChatType.GROUPS))
+    app.add_handler(CommandHandler("spam", cmd_spam, filters=filters.ChatType.GROUPS))
+    app.add_handler(CommandHandler("ham", cmd_ham, filters=filters.ChatType.GROUPS))
     app.add_handler(MessageHandler(
         filters.ChatType.GROUPS & ~filters.StatusUpdate.ALL & ~filters.COMMAND, moderate
     ))
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.UpdateType.EDITED_MESSAGE, moderate))
 
     log.info("Антиспам-бот запущен.")
+    load_learned()
     app.run_polling(allowed_updates=["message", "edited_message", "chat_member"])
 
 
