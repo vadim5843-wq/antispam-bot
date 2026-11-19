@@ -292,6 +292,19 @@ def notify_later(context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str) ->
     asyncio.create_task(_job())
 
 
+def confirm(context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str, seconds: int = 5) -> None:
+    """Короткое самоудаляющееся подтверждение команды."""
+    async def _job():
+        try:
+            sent = await context.bot.send_message(chat_id, text, disable_notification=True)
+            await asyncio.sleep(seconds)
+            await sent.delete()
+        except Exception:
+            pass
+
+    asyncio.create_task(_job())
+
+
 async def on_new_members(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.message
     for user in msg.new_chat_members:
@@ -412,10 +425,17 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     chat = update.effective_chat
     if user is None or not await is_admin(chat.id, user.id, context):
         return
-    await update.message.reply_text(
+    try:
+        await update.message.delete()
+    except Exception:
+        pass
+    confirm(
+        context, chat.id,
         f"🛡 Антиспам работает.\n"
         f"Удалено спам-сообщений за сессию: {deleted_stats.get(chat.id, 0)}\n"
-        f"Новичков под наблюдением: {sum(1 for (c, _) in join_times if c == chat.id)}"
+        f"Выучено спам-фраз: {len(learned_phrases)}\n"
+        f"Новичков под наблюдением: {sum(1 for (c, _) in join_times if c == chat.id)}",
+        seconds=15,
     )
 
 
@@ -426,7 +446,11 @@ async def cmd_spam(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     target = msg.reply_to_message
     if target is None:
-        await msg.reply_text("Отправь /spam ответом на спам-сообщение.")
+        confirm(context, msg.chat_id, "Отправь /spam ответом на спам-сообщение.")
+        try:
+            await msg.delete()
+        except Exception:
+            pass
         return
     spammer = target.from_user
     text = (target.text or target.caption or "").strip()
@@ -452,14 +476,12 @@ async def cmd_spam(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         parts.append("забанил")
     if learned:
         parts.append("запомнил")
-    reply = await msg.reply_text("✅ " + ", ".join(parts) + ".")
+    try:
+        await msg.delete()
+    except Exception as exc:
+        log.warning("cmd_spam: не удалось удалить команду: %s", exc)
     log.info("cmd_spam от %s: banned=%s learned=%s", user.id, banned, learned)
-    await asyncio.sleep(10)
-    for m in (reply, msg):
-        try:
-            await m.delete()
-        except Exception:
-            pass
+    confirm(context, msg.chat_id, "✅ " + ", ".join(parts) + ".")
 
 
 async def cmd_ham(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -480,7 +502,12 @@ async def cmd_ham(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 await msg.chat.unban_member(target.from_user.id, only_if_banned=True)
             except Exception:
                 pass
-    await msg.reply_text(
+    try:
+        await msg.delete()
+    except Exception:
+        pass
+    confirm(
+        context, msg.chat_id,
         "Ок, убрал из спам-листа и разбанил." if removed
         else "Такого текста нет в спам-листе."
     )
