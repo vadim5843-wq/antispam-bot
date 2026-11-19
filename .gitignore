@@ -1,0 +1,4 @@
+token.txt
+bot.log
+__pycache__/
+*.pyc
