@@ -578,7 +578,6 @@ def start_health_server() -> None:
 
 
 def main() -> None:
-    start_health_server()
     app = Application.builder().token(load_token()).build()
 
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, on_new_members))
@@ -593,7 +592,23 @@ def main() -> None:
 
     log.info("Антиспам-бот запущен.")
     load_learned()
-    app.run_polling(allowed_updates=["message", "edited_message", "chat_member"])
+
+    webhook_url = os.environ.get("WEBHOOK_URL", "").rstrip("/")
+    if webhook_url:
+        # Режим webhook: Telegram сам шлёт обновления на Render — входящий
+        # трафик будит инстанс, поэтому бот не засыпает и без пингеров.
+        port = int(os.environ.get("PORT", "10000"))
+        log.info("Режим webhook: порт %s, %s/telegram", port, webhook_url)
+        app.run_webhook(
+            listen="0.0.0.0",
+            port=port,
+            url_path="telegram",
+            webhook_url=f"{webhook_url}/telegram",
+            allowed_updates=["message", "edited_message", "chat_member"],
+        )
+    else:
+        start_health_server()
+        app.run_polling(allowed_updates=["message", "edited_message", "chat_member"])
 
 
 if __name__ == "__main__":
