@@ -34,6 +34,7 @@ MAT_MUTE_AFTER = 5               # после N удалённых матерн�
 MAT_MUTE_MINUTES = 10
 NEW_MEMBER_WATCH_SECONDS = 300   # новичок считается «под наблюдением» 5 минут
 BAN_NEWBIE_SPAMMER = True        # банить новичка за спам (иначе — просто удалять)
+REPEAT_SPAM_BAN = 3              # банить любого после N удалённых спам-сообщений
 MUTE_NEW_MEMBERS_MINUTES = 0     # >0 — новички не могут писать N минут после входа
 FLOOD_MAX_MESSAGES = 6           # не больше N сообщений...
 FLOOD_WINDOW_SECONDS = 10        # ...за столько секунд, иначе мьют
@@ -221,6 +222,7 @@ log = logging.getLogger("antispam")
 join_times = {}                  # (chat_id, user_id) -> время входа
 msg_times = defaultdict(list)    # (chat_id, user_id) -> [время сообщений]
 mat_counts = defaultdict(int)    # (chat_id, user_id) -> сколько раз удалён мат
+spam_counts = defaultdict(int)   # (chat_id, user_id) -> удалённых спам-сообщений (для бана рецидивистов)
 deleted_stats = defaultdict(int) # chat_id -> сколько спама удалено
 recent_msgs = deque(maxlen=300)  # (chat_id, msg_id, user_id, норм. текст) — для зачистки клонов
 # ----------------------------------------------------------------------
@@ -242,7 +244,7 @@ def has_bad_link(msg) -> bool:
     """True, если в сообщении есть ссылка на сайт не из TRUSTED_DOMAINS."""
     domains = []
     text = msg.text or msg.caption or ""
-    for ent in (msg.entities or []) + (msg.caption_entities or []):
+    for ent in tuple(msg.entities or ()) + tuple(msg.caption_entities or ()):
         if ent.type == "text_link" and ent.url:
             m = DOMAIN_RE.search(ent.url)
             if m:
@@ -368,11 +370,13 @@ async def moderate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             log.warning("Не удалось удалить сообщение (нужны права админа): %s", exc)
             return
         deleted_stats[msg.chat_id] += 1
+        spam_counts[key] += 1
         log.info("Удалён спам от %s (%s) в чате %s", user.id, user.username, msg.chat_id)
-        if is_newbie and BAN_NEWBIE_SPAMMER:
+        if (is_newbie and BAN_NEWBIE_SPAMMER) or spam_counts[key] >= REPEAT_SPAM_BAN:
             try:
                 await msg.chat.ban_member(user.id, revoke_messages=True)
                 join_times.pop(key, None)
+                spam_counts.pop(key, None)
                 notify_later(context, msg.chat_id, f"🚫 Спамер {user.mention_html()} забанен.")
             except Exception as exc:
                 log.warning("Не удалось забанить %s: %s", user.id, exc)
