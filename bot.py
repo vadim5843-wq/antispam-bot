@@ -259,6 +259,15 @@ def has_mat(msg) -> bool:
     return bool(MAT_RE.search(msg.text or msg.caption or ""))
 
 
+def matched_learned(msg) -> bool:
+    """Совпадение с фразой, выученной через /spam (подтверждено админом)."""
+    norm = normalize_text(msg.text or msg.caption or "")
+    for entry in learned_phrases:
+        if entry and (entry in norm or (len(norm) > 25 and norm in entry)):
+            return True
+    return False
+
+
 def looks_like_spam(msg) -> bool:
     raw = msg.text or msg.caption or ""
     low = raw.lower().replace("ё", "е")
@@ -371,8 +380,10 @@ async def moderate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             return
         deleted_stats[msg.chat_id] += 1
         spam_counts[key] += 1
-        log.info("Удалён спам от %s (%s) в чате %s", user.id, user.username, msg.chat_id)
-        if (is_newbie and BAN_NEWBIE_SPAMMER) or spam_counts[key] >= REPEAT_SPAM_BAN:
+        learned_hit = matched_learned(msg)
+        log.info("Удалён спам от %s (%s) в чате %s (learned=%s)",
+                 user.id, user.username, msg.chat_id, learned_hit)
+        if learned_hit or (is_newbie and BAN_NEWBIE_SPAMMER) or spam_counts[key] >= REPEAT_SPAM_BAN:
             try:
                 await msg.chat.ban_member(user.id, revoke_messages=True)
                 join_times.pop(key, None)
